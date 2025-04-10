@@ -1,1 +1,4 @@
-PyMuPDF==1.23.8 
+PyMuPDF==1.23.8
+Pillow>=9.0.0
+# Pillow removed 
+tkinterdnd2>=0.3.0 

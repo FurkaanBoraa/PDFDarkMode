@@ -1,7 +1,14 @@
 import fitz  # PyMuPDF
 import logging
 import os
-from typing import Optional, Dict
+import sys
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk # Import Pillow for image resizing
+from typing import Optional, Dict, Callable
+from tkinterdnd2 import DND_FILES, TkinterDnD # Import TkinterDnD
+import threading # Added for running conversion in background
+import queue # Added for thread communication
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -10,285 +17,836 @@ logger = logging.getLogger(__name__)
 # Global cache for loaded fallback fonts {style_key: fitz.Font}
 fallback_fonts: Dict[str, Optional[fitz.Font]] = {}
 
-def load_fallback_font(font_path: str, style_key: str) -> Optional[fitz.Font]:
-    """Load a fallback font from path or return cached instance."""
-    global fallback_fonts
-    if style_key in fallback_fonts:
-        return fallback_fonts[style_key] # Return cached font or None if loading failed previously
+# Dictionary to hold paths to fallback fonts
+fallback_paths = {}
 
-    if font_path and os.path.exists(font_path):
-        try:
-            # Try loading the font using fitz.Font
-            fallback_fonts[style_key] = fitz.Font(fontfile=font_path)
-            logger.info(f"Successfully loaded fallback font '{style_key}' from: {font_path}")
-        except Exception as e:
-            # Log the error
-            error_message = f"Failed to load fallback font '{style_key}' from {font_path}: {e}"
-            logger.error(error_message)
-            fallback_fonts[style_key] = None # Cache failure
-    else:
-        logger.warning(f"Fallback font file for style '{style_key}' not found or path not provided: {font_path}")
-        fallback_fonts[style_key] = None # Cache failure
-    return fallback_fonts[style_key]
+# Helper function to draw rounded rectangles on a canvas
+def create_rounded_rect(canvas, x1, y1, x2, y2, radius, outline_color, outline_width, fill_color):
+    """Draws a rounded rectangle on a tkinter canvas."""
+    points = [
+        x1 + radius, y1,
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    # Use empty string for fill if you only want outline
+    actual_fill = fill_color if fill_color else ""
+    return canvas.create_polygon(points, fill=actual_fill, outline=outline_color, width=outline_width, smooth=True)
 
-def get_fallback_font_for_span(span: dict, fallback_paths: Dict[str, str]) -> Optional[tuple[str, fitz.Font]]:
-    """Determine the best fallback font style based on span flags AND font name analysis."""
-    flags = span["flags"]
-    font_name_original = span["font"]
+def load_fallback_font(style='regular') -> Optional[fitz.Font]:
+    """Loads a fallback font based on style, using caching."""
+    global fallback_fonts, fallback_paths
+    if style in fallback_fonts:
+        return fallback_fonts[style]
 
-    # --- Determine Style from Flags AND Name --- 
-    # Check flags first
-    flag_bold = bool(flags & 2) 
-    flag_italic = bool(flags & 1)
+    font_path = fallback_paths.get(style)
+    if not font_path or not os.path.exists(font_path):
+        logger.error(f"Fallback font path not found or invalid for style '{style}': {font_path}")
+        return None
 
-    # Check name as a secondary indicator (case-insensitive)
-    name_lower = font_name_original.lower()
-    name_bold = "bold" in name_lower or "-bd" in name_lower
-    name_italic = "italic" in name_lower or "oblique" in name_lower or "-it" in name_lower
-    
-    # Combine flag and name checks - prioritize flags if set, otherwise use name
-    is_bold = flag_bold or name_bold
-    is_italic = flag_italic or name_italic
-    # --- End Style Determination ---
-
-    # Try different style combinations in order of preference
-    style_attempts = []
-    if is_bold and is_italic:
-        style_attempts = ["bold_italic", "bold", "italic", "regular"]
-    elif is_bold:
-        style_attempts = ["bold", "regular"]
-    elif is_italic:
-        style_attempts = ["italic", "regular"]
-    else:
-        style_attempts = ["regular"]
-        
-    # Try each style in order until we find one that works
-    for style_key in style_attempts:
-        font_path = fallback_paths.get(style_key)
-        if font_path:
-            font = load_fallback_font(font_path, style_key)
-            if font:
-                registration_name = f"Fallback-{style_key}"
-                return registration_name, font
-    
-    logger.warning(f"No suitable fallback font found for original font: {font_name_original}") 
-    return None
-
-def convert_pdf_colors(
-    input_pdf_path: str,
-    output_pdf_path: str,
-    fallback_font_paths: Optional[Dict[str, str]] = None
-) -> Optional[str]:
-    """
-    Convert a PDF's text color to white and background to black while preserving layout and non-text elements.
-
-    Args:
-        input_pdf_path (str): Path to the input PDF file.
-        output_pdf_path (str): Path where the modified PDF will be saved.
-        fallback_font_paths (Optional[Dict[str, str]]): Dictionary mapping styles
-            ('regular', 'bold', 'italic', 'bold_italic') to TTF font file paths.
-            Example: {'regular': 'arial.ttf', 'bold': 'arialbd.ttf', ...}
-
-    Returns:
-        Optional[str]: Error message if an error occurs, None if successful.
-
-    This function:
-    1. Opens the input PDF.
-    2. Creates a new PDF for output.
-    3. For each page:
-       - Adds a black background layer.
-       - Extracts text blocks.
-       - Redraws text in white, attempting original font first, then appropriate fallback font if provided.
-       - Preserves non-text elements (images).
-    4. Saves the modified PDF.
-    """
-    
-    # Clear global font cache at the start of each conversion
-    global fallback_fonts
-    fallback_fonts.clear()
-    logger.debug("Cleared global fallback font cache.")
-    
     try:
-        # Open the input PDF
+        font = fitz.Font(fontfile=font_path)
+        fallback_fonts[style] = font
+        logger.info(f"Successfully loaded fallback font '{style}' from {font_path}")
+        return font
+    except Exception as e:
+        logger.error(f"Failed to load fallback font '{style}' from {font_path}: {e}", exc_info=True)
+        fallback_fonts[style] = None # Cache failure to prevent retries
+        return None
+
+def get_fallback_font_for_span(fontname: str, flags: int) -> Optional[tuple[fitz.Font, str]]:
+    """Determines the best fallback font style based on flags and attempts to load it."""
+    # Correctly check flags using bitwise AND
+    is_italic = bool(flags & 1)  # Check for Italic flag
+    is_bold = bool(flags & 16) # Check for Bold flag
+    logger.debug(f"Attempting fallback for font '{fontname}' (Flags: {flags}, Bold: {is_bold}, Italic: {is_italic})")
+
+    style_priority = []
+    if is_bold and is_italic:
+        style_priority = ['bold_italic', 'bold', 'italic', 'regular']
+    elif is_bold:
+        style_priority = ['bold', 'regular']
+    elif is_italic:
+        style_priority = ['italic', 'regular']
+    else:
+        style_priority = ['regular']
+
+    for style_key in style_priority:
+        logger.debug(f"Trying style: '{style_key}'")
+        font = load_fallback_font(style_key)
+        if font:
+            fallback_fontname = f"Fallback-{style_key}"
+            logger.debug(f"SUCCESS: Found fallback font '{fallback_fontname}' for '{fontname}' (Style: {style_key})")
+            return font, fallback_fontname
+
+    logger.warning(f"FAILURE: No suitable fallback font found for '{fontname}' after trying styles: {style_priority}")
+    return None, None
+
+def convert_pdf_colors(input_pdf_path: str, output_pdf_path: str, progress_callback: Optional[Callable[[int, int], None]] = None) -> Optional[str]:
+    """Converts PDF text to white and background to black, with progress callback."""
+    global fallback_fonts, fallback_paths # Ensure access to globals
+
+    # Clear font cache at the beginning of each conversion
+    fallback_fonts.clear()
+    logger.info("Fallback font cache cleared.")
+
+    # Basic validation
+    if not isinstance(input_pdf_path, str) or not input_pdf_path.lower().endswith('.pdf'):
+        return "Invalid input file path. Must be a string ending with .pdf"
+    if not isinstance(output_pdf_path, str) or not output_pdf_path.lower().endswith('.pdf'):
+        return "Invalid output file path. Must be a string ending with .pdf"
+
+    try:
         doc = fitz.open(input_pdf_path)
+        new_doc = fitz.open() # Create a new PDF for output
 
-        # Create a new PDF for output
-        new_doc = fitz.open()
+        total_pages = len(doc)
+        logger.info(f"Starting PDF conversion for '{input_pdf_path}' ({total_pages} pages)")
 
-        # Process each page
-        for page_num in range(len(doc)):
-            page = doc[page_num]
+        # Define colors
+        white = (1, 1, 1)
+        black = (0, 0, 0)
+
+        for page_num, page in enumerate(doc):
+            logger.info(f"Processing page {page_num + 1}/{total_pages}")
 
             # Create a new page in the output document with the same dimensions
             new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
 
-            # Add black background
-            new_page.draw_rect(new_page.rect, color=(0, 0, 0), fill=(0, 0, 0))
+            # Set background to black
+            # Use Shape to draw rect to avoid opacity issues sometimes seen with draw_rect
+            bg_shape = new_page.new_shape()
+            bg_shape.draw_rect(new_page.rect)
+            bg_shape.finish(color=black, fill=black, width=0) # Fill with black
+            bg_shape.commit()
 
-            # --- Process and Redraw Drawings (Attempt to make table lines white) ---
+            # Extract drawings first and draw them in white
             drawings = page.get_drawings()
+            drawing_shape = new_page.new_shape()
+            logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawing paths.")
             for path in drawings:
-                # Check path properties to identify potential table lines/borders
-                is_stroked = path.get("stroke_opacity", 1) != 0 and path.get("color") # Has stroke color
-                is_filled = path.get("fill_opacity", 1) != 0 and path.get("fill")    # Has fill color
-                path_width = path.get("width", 1.0) # Line width, default to 1.0 if None
+                # Make lines/borders white, keep fill transparent unless it's explicitly black
+                path_color = white # Default to white lines
+                fill_color = path['fill'] # Use original fill color
+                path_width = path['width'] if path['width'] is not None else 1.0 # Default width if None
 
-                # More inclusive heuristics for table borders:
-                # 1. Thin stroked paths (likely borders)
-                # 2. Filled rectangles (likely table cells)
-                # 3. Wider lines that might be table borders
-                if (is_stroked and path_width < 3.0) or (is_filled and path.get("items", [])[0][0] == "re"):
-                    for item in path["items"]:
-                        # Ensure we have a valid width for drawing operations
-                        draw_width = max(0.1, float(path_width or 1.0))  # Convert to float and ensure positive
-                        
-                        if item[0] == "l":  # Line
-                            new_page.draw_line(item[1], item[2], color=(1, 1, 1), width=draw_width)
-                        elif item[0] == "re":  # Rectangle
-                            # For filled rectangles, draw both fill and border in white
-                            if is_filled:
-                                new_page.draw_rect(item[1], color=(1, 1, 1), fill=(1, 1, 1), width=draw_width)
-                            else:
-                                new_page.draw_rect(item[1], color=(1, 1, 1), fill=None, width=draw_width)
-                        elif item[0] == "c":  # Curve
-                            # Draw curves as lines between control points
-                            points = item[1]
-                            for i in range(len(points) - 1):
-                                new_page.draw_line(points[i], points[i+1], color=(1, 1, 1), width=draw_width)
-                        elif item[0] == "qu":  # Quad
-                            # Draw quads as lines between points
-                            points = item[1]
-                            for i in range(len(points) - 1):
-                                new_page.draw_line(points[i], points[i+1], color=(1, 1, 1), width=draw_width)
-                    logger.debug(f"Redrawing path as potential table border: color={path.get('color')}, width={draw_width}, type={path.get('items', [])[0][0] if path.get('items') else 'unknown'}")
-                else:
-                    logger.debug(f"Skipping path: color={path.get('color')}, width={path_width}, type={path.get('items', [])[0][0] if path.get('items') else 'unknown'}")
-            # --- End Drawing Processing ---
+                # Process different path types
+                for item in path["items"]:
+                    op = item[0]
+                    if op == "l": # line
+                        drawing_shape.draw_line(item[1], item[2])
+                    elif op == "re": # rectangle
+                        # If rectangle is filled (likely a background or table cell), make fill white too
+                        if path['fill']:
+                           fill_color = white
+                        drawing_shape.draw_rect(item[1])
+                    elif op == "c": # curve
+                         drawing_shape.draw_bezier(item[1], item[2], item[3], item[4])
+                    elif op == "qu": # quad
+                         drawing_shape.draw_quad(item[1])
+                    # Finalize and commit each path segment individually or group logically
+                # Finish the path segment
+                drawing_shape.finish(color=path_color, fill=fill_color, width=path_width, even_odd=path.get('even_odd', False))
+            drawing_shape.commit() # Commit all drawing paths for the page
+            logger.debug(f"Page {page_num + 1}: Finished processing drawings.")
 
-            # Get text blocks with flags
-            # Moved after drawing processing to ensure text is on top
-            blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-
-            # Process each text block
+            # Extract text blocks and insert with white color and fallback fonts
+            blocks = page.get_text("dict")["blocks"]
             for block in blocks:
-                if "lines" in block:  # This is a text block
+                if block["type"] == 0: # Text block
                     for line in block["lines"]:
                         for span in line["spans"]:
-                            # Get the original text and its properties
                             text = span["text"]
-                            font_name_original = span["font"]
-                            size = span["size"]
-                            origin = span["origin"]
-                            flags = span["flags"] # Get flags for bold/italic check
+                            fontname = span["font"]
+                            fontsize = span["size"]
+                            origin = fitz.Point(span["origin"][0], span["origin"][1])
+                            flags = span["flags"]
 
-                            # Attempt to draw the text in white with the original font
+                            # Attempt to find the font in the original document or load system font
                             try:
-                                new_page.insert_text(
-                                    point=origin,
-                                    text=text,
-                                    fontsize=size,
-                                    color=(1, 1, 1),  # White color
-                                    fontname=font_name_original
-                                )
-                            except RuntimeError as font_error:
-                                fallback_info = None
-                                # If original font fails, try to get appropriate fallback style
-                                if fallback_font_paths and ("cannot open resource" in str(font_error) or "unknown file format" in str(font_error)):
-                                    fallback_info = get_fallback_font_for_span(span, fallback_font_paths)
-                                
-                                if fallback_info:
-                                    fallback_fontname, fallback_font_obj = fallback_info
-                                    # style_key = fallback_fontname.split('-')[-1] # Get style like 'regular', 'bold' -> No longer reliable, name is just Fallback-style
-                                    
-                                    logger.warning(
-                                        # f"Font '{font_name_original}' failed on page {page_num}. Error: {font_error}. Using fallback style '{style_key}'. Text: '{text[:20]}...'" -> Use fallback_fontname
-                                         f"Font '{font_name_original}' failed on page {page_num}. Error: {font_error}. Using fallback font '{fallback_fontname}'. Text: '{text[:20]}...'"
-                                    )
-                                    try:
-                                        # Ensure the specific fallback style font is registered
-                                        if fallback_font_obj.buffer:
-                                            # Register the font using the specific name (e.g., Fallback-bold)
-                                            new_page.insert_font(fontname=fallback_fontname, fontbuffer=fallback_font_obj.buffer)
-                                        else:
-                                             # Use style_key derived correctly inside the try block for error logging
-                                             loaded_style_key = fallback_fontname.split('-')[-1]
-                                             raise ValueError(f"Fallback font object for {loaded_style_key} has no buffer.")
-                                        
-                                        # Insert text using the registered fallback font name
-                                        new_page.insert_text(
-                                            point=origin,
-                                            text=text,
-                                            fontsize=size,
-                                            color=(1, 1, 1),
-                                            fontname=fallback_fontname # Use the style-specific fallback name
-                                        )
-                                    except Exception as fallback_error:
-                                        logger.error(
-                                            f"Fallback font insertion failed for '{fallback_fontname}' on page {page_num}. Error: {fallback_error}. Skipping text: '{text[:20]}...'"
-                                        )
+                                font = fitz.Font(fontname=fontname)
+                                # Check if font contains necessary glyphs (simple check)
+                                if not all(font.has_glyph(ord(c)) for c in text if ord(c) > 31):
+                                    raise ValueError("Missing glyphs")
+                                current_fontname = fontname
+                                current_font = font
+                            except Exception as e:
+                                # Font not found, invalid, or missing glyphs - use fallback
+                                logger.warning(f"Font '{fontname}' failed on page {page_num + 1} (Size: {fontsize:.2f}, Flags: {flags}): {e}. Text: '{text[:30]}...' Attempting fallback.")
+                                fallback_font, fallback_fontname = get_fallback_font_for_span(fontname, flags)
+                                if fallback_font:
+                                    current_font = fallback_font
+                                    current_fontname = fallback_fontname
+                                    logger.info(f"Using fallback '{current_fontname}' for font '{fontname}'.")
                                 else:
-                                    # If no fallback font path configured or different error
-                                    logger.error(
-                                        f"Font '{font_name_original}' failed on page {page_num} and no usable fallback provided/loaded. Error: {font_error}. Skipping text: '{text[:20]}...'"
-                                    )
-                                    # Optionally re-raise: raise font_error
+                                    logger.error(f"Critical: No fallback font available for '{fontname}'. Skipping text: '{text[:30]}...'" )
+                                    continue # Skip this span if no fallback available
 
-            # Copy non-text elements (images, etc.)
-            # Use get_images(full=True) to get image bounding boxes
+                            # Insert text with the determined font and white color
+                            try:
+                                insert_rc = new_page.insert_font(fontname=current_fontname, fontbuffer=current_font.buffer)
+                                if insert_rc < 0:
+                                     logger.error(f"Failed to insert font {current_fontname} into new page {page_num + 1}. RC: {insert_rc}")
+                                     continue # Skip if font insertion failed
+
+                                new_page.insert_text(origin, text, fontname=current_fontname,
+                                                     fontsize=fontsize, color=white)
+                            except Exception as text_insert_error:
+                                 logger.error(f"Error inserting text with font {current_fontname} on page {page_num + 1}: {text_insert_error}. Text: '{text[:30]}...'", exc_info=True)
+
+            # Handle Images (Copy images from original page to new page)
             img_list = page.get_images(full=True)
-            img_bboxes = [page.get_image_bbox(img_info) for img_info in img_list]
+            if img_list:
+                 logger.info(f"Page {page_num + 1}: Found {len(img_list)} images.")
+                 for img_info in img_list:
+                      xref = img_info[0]
+                      base_image = doc.extract_image(xref)
+                      img_bytes = base_image["image"]
+                      img_rect = page.get_image_rects(xref)[0] # Get the first rectangle for the image
+                      try:
+                          new_page.insert_image(img_rect, stream=img_bytes)
+                          logger.debug(f"Page {page_num + 1}: Inserted image with xref {xref} at {img_rect}")
+                      except Exception as img_err:
+                           logger.error(f"Page {page_num + 1}: Failed to insert image xref {xref}: {img_err}", exc_info=True)
 
-            for i, img_info in enumerate(img_list):
-                xref = img_info[0]
-                img_bbox = img_bboxes[i]
-
-                # Check if the bounding box is valid
-                if not img_bbox or img_bbox.is_empty or img_bbox.is_infinite:
-                    logger.warning(f"Skipping image with invalid/empty bbox on page {page_num}: xref={xref}, bbox={img_bbox}")
-                    continue
-
-                base_image = doc.extract_image(xref)
-                if not base_image:
-                    logger.warning(f"Could not extract image with xref={xref} on page {page_num}")
-                    continue
-
-                image_bytes = base_image["image"]
-
-                # Insert the image at its original position using its bounding box
+            # --- Call progress callback --- 
+            if progress_callback:
                 try:
-                    new_page.insert_image(
-                        rect=img_bbox,
-                        stream=image_bytes
-                    )
-                except ValueError as img_error:
-                     logger.warning(f"Skipping image due to insertion error on page {page_num}: xref={xref}, bbox={img_bbox}, error={img_error}")
+                    progress_callback(page_num + 1, total_pages)
+                except Exception as cb_err:
+                     logger.warning(f"Progress callback failed on page {page_num + 1}: {cb_err}", exc_info=False) # Don't log full trace for callback errors
 
-
-        # Save the modified PDF
-        # Use garbage collection to ensure resources are freed before saving
-        new_doc.save(output_pdf_path, garbage=4, deflate=True)
+        # Save the new document
+        new_doc.save(output_pdf_path, garbage=4, deflate=True, clean=True)
         new_doc.close()
         doc.close()
+        logger.info(f"Successfully created dark mode PDF: '{output_pdf_path}'")
+        return None # Indicate success
 
-        logger.info(f"Successfully processed PDF: {input_pdf_path}")
-        return None
-
+    except FileNotFoundError:
+        error_msg = f"Error: Input file not found at '{input_pdf_path}'"
+        logger.error(error_msg)
+        return error_msg
+    except fitz.fitz.FileDataError as e:
+        error_msg = f"Error: Corrupt or invalid PDF file '{input_pdf_path}'. Details: {e}"
+        logger.error(error_msg)
+        return error_msg
     except Exception as e:
-        # Ensure documents are closed even if error occurs mid-process
-        doc_to_close = locals().get('doc')
-        new_doc_to_close = locals().get('new_doc')
-        try:
-            if doc_to_close:
-                doc_to_close.close()
-        except Exception as close_ex:
-            logger.error(f"Error closing input document: {close_ex}")
-        try:
-            if new_doc_to_close:
-                 new_doc_to_close.close()
-        except Exception as close_ex:
-            logger.error(f"Error closing output document: {close_ex}")
-
-            
-        error_msg = f"Error processing PDF: {str(e)}"
+        error_msg = f"An unexpected error occurred during PDF processing: {e}"
         logger.error(error_msg, exc_info=True) # Log full traceback
-        return error_msg 
+        return error_msg
+
+class PDFDarkModeApp:
+    def __init__(self, root):
+        self.root = root # root is now a TkinterDnD.Tk object
+        self.root.title("PDF Dark Mode Converter")
+        self.root.configure(bg="black", padx=50, pady=50)
+
+        self.input_pdf_path = None
+        self.output_pdf_path = None
+        self.button_state = tk.NORMAL
+        self.preview_image_tk = None
+        self.upload_icon_image = None
+        self.output_preview_image_tk = None
+        self.progress_fill_id = None # ID for the progress bar fill rectangle
+
+        # --- Threading & Queue --- 
+        self.conversion_thread = None
+        self.progress_queue = queue.Queue()
+        self.status_animation_after_id = None # To store the .after() id
+
+        # --- Styling ---
+        self.style = ttk.Style()
+        self.style.configure("TLabel", background="black", foreground="white", font=("Inter", 22, "bold"))
+        self.style.configure("TFrame", background="black")
+
+        # --- Component 1: Status Label ---
+        self.status_label = ttk.Label(root, text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle", font=("Inter", 22, "bold"), wraplength=root.winfo_screenwidth() - 100)
+        self.status_label.pack(pady=(0, 40))
+
+        # --- Component 2: Boxes and Arrow ---
+        self.component2_frame = ttk.Frame(root, style="TFrame")
+        self.component2_frame.pack(pady=(0, 40))
+
+        box_width = 371
+        box_height = 466
+        corner_radius = 10
+        border_width = 6
+        border_color = "white"
+        fill_color = "black"
+        arrow_gap = 35
+
+        # Load arrow image early to get width for progress bar calculation
+        arrow_width = 0
+        try:
+            # Use Pillow to reliably get size without creating Tk object yet
+            arrow_img_pil = Image.open("arrow.png")
+            arrow_width = arrow_img_pil.width
+            self.arrow_image = ImageTk.PhotoImage(arrow_img_pil) # Store Tk image for later use
+            logger.debug(f"Arrow image loaded, width: {arrow_width}")
+        except Exception as e:
+             logger.warning(f"Could not load arrow.png to determine width: {e}")
+             # Estimate or use a default if needed, or make progress bar width fixed
+             arrow_width = 50 # Estimate if loading failed
+
+        # Left Box
+        self.left_box = tk.Canvas(self.component2_frame, width=box_width, height=box_height, bg=fill_color, highlightthickness=0)
+        self.left_box.pack(side=tk.LEFT, padx=(0, arrow_gap))
+
+        # Arrow Label
+        if hasattr(self, 'arrow_image'):
+            self.arrow_label = tk.Label(self.component2_frame, image=self.arrow_image, background=fill_color)
+            self.arrow_label.image = self.arrow_image # Keep reference
+            self.arrow_label.pack(side=tk.LEFT, padx=(0, arrow_gap))
+        else:
+            self.arrow_placeholder = tk.Label(self.component2_frame, text="->", font=("Inter", 40, "bold"), background=fill_color, foreground=border_color)
+            self.arrow_placeholder.pack(side=tk.LEFT, padx=(0, arrow_gap))
+
+        # Right Box
+        self.right_box = tk.Canvas(self.component2_frame, width=box_width, height=box_height, bg=fill_color, highlightthickness=0)
+        self.right_box.pack(side=tk.LEFT)
+        create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, border_color, border_width, "")
+
+        # --- Component 3: Convert Button / Progress Bar Container ---
+        self.button_progress_frame = ttk.Frame(root, style="TFrame")
+        self.button_progress_frame.pack()
+
+        button_height = 40 # Progress bar height will match this
+        # Calculate dynamic progress bar width
+        self.progress_bar_width = box_width + arrow_gap + arrow_width + arrow_gap + box_width
+        logger.debug(f"Calculated progress bar width: {self.progress_bar_width}")
+
+        # --- Create Button Canvas (initially shown) ---
+        button_width_fixed = 256 # Keep button fixed size
+        button_fill = "#585858"
+        self.convert_button_canvas = tk.Canvas(self.button_progress_frame, width=button_width_fixed, height=button_height, bg=button_fill, highlightthickness=0)
+        self.button_border_id = create_rounded_rect(self.convert_button_canvas, border_width/2, border_width/2, button_width_fixed - border_width/2, button_height - border_width/2, corner_radius, border_color, border_width, "")
+        self.button_text_id = self.convert_button_canvas.create_text(button_width_fixed/2, button_height/2, text="DÖNÜŞTÜR", fill=border_color, font=("Inter", 16, "bold"))
+        self.convert_button_canvas.bind("<Button-1>", self.start_conversion_event)
+        self.convert_button_canvas.pack() # Show button initially
+
+        # --- Create Custom Progress Bar Canvas (initially hidden) ---
+        self.progress_canvas = tk.Canvas(self.button_progress_frame, width=self.progress_bar_width, height=button_height, bg=fill_color, highlightthickness=0)
+        # Draw initial border but don't pack yet
+        create_rounded_rect(self.progress_canvas, border_width/2, border_width/2, self.progress_bar_width - border_width/2, button_height - border_width/2, corner_radius, border_color, border_width, "")
+
+        # --- Setup Drop Target for the ROOT window ---
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind('<<Drop>>', self.handle_drop)
+        logger.debug("Root window registered as drop target and <<Drop>> event bound.")
+        # Removed drop target setup from self.left_box
+
+        # Initial setup of icon/text in left box
+        self.recreate_left_box_initial_content() # This now also draws initial border
+
+    def handle_drop(self, event):
+        """Handles file drop events on the left box."""
+        filepath_string = event.data
+        logger.debug(f"<<Drop>> event received. Data: '{filepath_string}'")
+
+        # Clean up the path string (remove braces, handle potential quoting)
+        if filepath_string.startswith('{') and filepath_string.endswith('}'):
+            # Take content between braces, handle cases where path itself has spaces
+            # This might need more robust parsing if paths have braces
+             filepath = filepath_string[1:-1]
+             # Further check if path was quoted inside braces
+             if filepath.startswith('"') and filepath.endswith('"'):
+                  filepath = filepath[1:-1]
+        else:
+            filepath = filepath_string
+
+        # Check if the cleaned path exists and is a PDF file
+        if filepath and os.path.isfile(filepath) and filepath.lower().endswith('.pdf'):
+            logger.info(f"File dropped: {filepath}")
+            self.process_selected_file(filepath)
+        else:
+            logger.warning(f"Dropped item is not a valid PDF file path: '{filepath}'")
+            messagebox.showwarning("Invalid Drop", "Lütfen yalnızca tek bir PDF dosyası sürükleyin.")
+
+
+    def select_file_event(self, event=None):
+        """Wrapper for file dialog selection."""
+        logger.debug("Entering select_file_event (click).")
+        filepath = filedialog.askopenfilename(
+            title="Select Input PDF",
+            filetypes=(("PDF files", "*.pdf"), ("All files", "*.*"))
+        )
+        if filepath:
+            logger.info(f"File selected via dialog: {filepath}")
+            self.process_selected_file(filepath)
+        else:
+            logger.info("File selection cancelled.")
+
+
+    def process_selected_file(self, filepath: str):
+        """Processes the selected/dropped PDF: Generates preview and updates UI."""
+        logger.debug(f"Processing file: {filepath}")
+        doc = None
+        try:
+            # Define dimensions
+            box_width = 371
+            box_height = 466
+            border_width = 6
+            corner_radius = 10
+            logger.debug(f"Processing with Box dimensions: width={box_width}, height={box_height}, border={border_width}")
+
+            # --- Update state --- 
+            self.input_pdf_path = filepath
+            base_name = os.path.basename(filepath)
+            self.status_label.config(text="DÖNÜŞTÜR butonuna bas")
+            logger.info(f"Input PDF set: {self.input_pdf_path}")
+
+            # --- Clear existing content --- 
+            logger.debug("Clearing left and right boxes for preview.")
+            self.left_box.delete("all") 
+            self.right_box.delete("all") 
+
+            # --- Render and Resize PDF Preview using Pillow --- 
+            logger.debug("Opening PDF document for preview.")
+            doc = fitz.open(self.input_pdf_path)
+            if len(doc) == 0: raise ValueError("PDF document has no pages.")
+            page = doc[0]
+            logger.debug(f"Processing page 0: {page.rect}")
+
+            target_width_available = box_width - (2 * border_width)
+            target_height_available = box_height - (2 * border_width)
+            page_rect = page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            logger.debug(f"Available space: width={target_width_available}, height={target_height_available}")
+            logger.debug(f"Original page size: width={page_width}, height={page_height}")
+
+            if page_width <= 0 or page_height <= 0:
+                raise ValueError(f"Invalid page dimensions: {page_width}x{page_height}")
+
+            # Calculate zoom factor to fit within available space
+            zoom_w = target_width_available / page_width
+            zoom_h = target_height_available / page_height
+            zoom = min(zoom_w, zoom_h)
+            logger.debug(f"Calculated zoom factors: width_zoom={zoom_w:.4f}, height_zoom={zoom_h:.4f}, chosen_zoom={zoom:.4f}")
+
+            # Calculate final target dimensions for the preview image
+            final_width = int(page_width * zoom)
+            final_height = int(page_height * zoom)
+            logger.debug(f"Target preview dimensions: width={final_width}, height={final_height}")
+
+            # Render pixmap at a reasonable base resolution
+            mat = fitz.Matrix(1, 1) # Render at original scale
+            logger.debug("Rendering pixmap at native scale (dpi=150).")
+            pix = page.get_pixmap(matrix=mat, dpi=150)
+            logger.debug(f"Pixmap rendered: width={pix.width}, height={pix.height}, alpha={pix.alpha}")
+
+            # Close PDF document now that we have the pixmap
+            if doc: doc.close(); doc = None
+            logger.debug("PDF document closed.")
+
+            # --- Convert pixmap to Pillow Image and Resize --- 
+            logger.debug("Converting pixmap to Pillow Image.")
+            if pix.alpha:
+                pil_image = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+            else:
+                pil_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            logger.debug(f"Pillow Image created: size={pil_image.size}")
+
+            logger.debug(f"Resizing Pillow Image to {final_width}x{final_height} using LANCZOS.")
+            resized_pil_image = pil_image.resize((final_width, final_height), Image.Resampling.LANCZOS)
+            logger.debug(f"Pillow Image resized: size={resized_pil_image.size}")
+
+            # --- Convert resized Pillow Image to Tkinter PhotoImage --- 
+            logger.debug("Converting resized Pillow Image to tk.PhotoImage.")
+            self.preview_image_tk = ImageTk.PhotoImage(resized_pil_image)
+            logger.debug(f"PhotoImage created from resized Pillow image: {self.preview_image_tk}")
+            tk_img_width = self.preview_image_tk.width()
+            tk_img_height = self.preview_image_tk.height()
+            logger.debug(f"PhotoImage dimensions (Tkinter): width={tk_img_width}, height={tk_img_height}")
+
+            # --- Display Preview --- 
+            logger.debug("Displaying preview image.")
+            # Redraw border first
+            create_rounded_rect(self.left_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+            img_x_pos = box_width / 2
+            img_y_pos = box_height / 2
+            logger.debug(f"Placing PhotoImage on canvas at ({img_x_pos}, {img_y_pos}) with anchor=CENTER.")
+            self.left_box.create_image(img_x_pos, img_y_pos, anchor=tk.CENTER, image=self.preview_image_tk)
+            # No need for extra image_ref here, self.preview_image_tk is sufficient
+            logger.debug("create_image called.")
+
+            # --- Redraw Right Box & Enable Button --- 
+            logger.debug("Redrawing right box border and enabling button after preview.")
+            create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+            self.set_button_state(tk.NORMAL)
+            logger.debug(f"Processing finished for file: {filepath}")
+
+        except Exception as e:
+             if doc: doc.close() # Ensure doc is closed on error
+             error_msg = f"Error processing selected/dropped file: {e}"
+             logger.error(error_msg, exc_info=True)
+             messagebox.showerror("PDF Processing Error", error_msg)
+             # Reset state
+             logger.debug("Resetting state after error during file processing.")
+             self.input_pdf_path = None
+             self.status_label.config(text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle")
+             # Reset boxes to initial state
+             self.recreate_left_box_initial_content() # Handles left box clearing/redrawing
+             self.right_box.delete("all") # Clear right box
+             # Redraw right border
+             box_width = 371
+             box_height = 466
+             border_width = 6
+             corner_radius = 10
+             create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+             self.set_button_state(tk.NORMAL)
+
+    def recreate_left_box_initial_content(self):
+        """Helper to redraw the initial icon and text in the left box."""
+        logger.debug("Recreating initial content in left box.")
+        # Define needed variables locally or ensure they are accessible
+        box_width = 371
+        box_height = 466
+        fill_color = "black"
+        border_color = "white"
+        border_width = 6
+        corner_radius = 10
+
+        # Clear and Re-draw border
+        self.left_box.delete("all")
+        create_rounded_rect(self.left_box, border_width/2, border_width/2,
+                            box_width - border_width/2, box_height - border_width/2,
+                            corner_radius, border_color, border_width, "")
+
+        # Re-create Icon Widget
+        try:
+            # Reload image if necessary or use cached
+            if not self.upload_icon_image:
+                 logger.debug("Reloading upload icon image.")
+                 self.upload_icon_image = tk.PhotoImage(file="add_file.png")
+
+            self.upload_icon_widget = tk.Label(self.left_box, image=self.upload_icon_image, background=fill_color)
+            self.upload_icon_widget.image = self.upload_icon_image
+        except tk.TclError:
+             logger.warning("Could not load add_file.png on reset.")
+             self.upload_icon_widget = tk.Label(self.left_box, text="[Icon Err]", background=fill_color, foreground=border_color, font=("Inter", 16, "bold"))
+
+        # Re-create Text Widget
+        self.upload_text_widget = tk.Label(self.left_box, text="Sürükle veya tıklayıp seç", background=fill_color, foreground=border_color, font=("Inter", 16, "bold"))
+
+        # Re-place elements onto the canvas
+        icon_y_pos = box_height / 2 - 50
+        text_y_pos = icon_y_pos + 100
+        self.left_box.create_window(box_width / 2, icon_y_pos, window=self.upload_icon_widget)
+        self.left_box.create_window(box_width / 2, text_y_pos, window=self.upload_text_widget)
+
+        # Re-bind clicks to the newly created widgets
+        logger.debug("Re-binding click events for initial left box content.")
+        self.upload_icon_widget.bind("<Button-1>", self.select_file_event)
+        self.upload_text_widget.bind("<Button-1>", self.select_file_event)
+
+    def set_button_state(self, state):
+        """Visually enable/disable the canvas button."""
+        self.button_state = state
+        # Keep border white when enabled, grey when disabled
+        new_border_color = "white" if state == tk.NORMAL else "#555555"
+        # Text color matches border state
+        new_text_color = "white" if state == tk.NORMAL else "#555555"
+
+        # Background of the canvas itself doesn't change, only border/text
+        if hasattr(self, 'button_border_id'): # Ensure items exist
+             self.convert_button_canvas.itemconfig(self.button_border_id, outline=new_border_color)
+        if hasattr(self, 'button_text_id'):
+             self.convert_button_canvas.itemconfig(self.button_text_id, fill=new_text_color)
+
+    def animate_status_dots(self, dot_count=0):
+        """Animates the dots for the 'Converting...' status message."""
+        if self.status_animation_after_id is None:
+             # Animation was cancelled/stopped
+             return
+        base_text = "Dönüştürülüyor"
+        dots = "." * (dot_count % 4)
+        self.status_label.config(text=f"{base_text}{dots}")
+        # Schedule next update
+        self.status_animation_after_id = self.root.after(500, self.animate_status_dots, dot_count + 1)
+
+    def stop_status_animation(self):
+        """Stops the status label dot animation."""
+        if self.status_animation_after_id:
+            self.root.after_cancel(self.status_animation_after_id)
+            self.status_animation_after_id = None
+            logger.debug("Status animation stopped.")
+
+    def update_progress(self, current_page, total_pages):
+        """Callback function to update progress bar from conversion thread."""
+        # Put progress data into the queue for the main thread to process
+        self.progress_queue.put((current_page, total_pages))
+
+    def check_progress_queue(self):
+        """Checks the queue for progress updates and handles completion."""
+        try:
+            while True: # Process all pending messages
+                message = self.progress_queue.get_nowait()
+                if isinstance(message, tuple) and len(message) == 2:
+                    if message[0] == "DONE":
+                        # Conversion finished message
+                        logger.debug("Received DONE signal from worker thread.")
+                        result = message[1]
+                        self.handle_conversion_complete(result)
+                        self.conversion_thread = None # Clear thread reference
+                        return # Stop checking queue
+                    else:
+                        # --- Progress update message --- 
+                        current_page, total_pages = message
+                        progress_value = (current_page / total_pages) * 100
+                        logger.debug(f"Progress update received: {current_page}/{total_pages} ({progress_value:.1f}%)")
+
+                        # --- Update Custom Progress Bar Canvas --- 
+                        border_width = 6 # Make consistent
+                        corner_radius = 10
+                        progress_bar_height = 40
+                        fill_color = "white"
+
+                        # Calculate width of the fill area inside the border
+                        fill_area_width = self.progress_bar_width - border_width
+                        fill_rect_width = (progress_value / 100) * fill_area_width
+
+                        # Define coordinates for the fill rectangle
+                        x1 = border_width / 2
+                        y1 = border_width / 2
+                        x2 = x1 + fill_rect_width
+                        y2 = progress_bar_height - border_width / 2
+
+                        # Delete previous fill rectangle if it exists
+                        if self.progress_fill_id:
+                            self.progress_canvas.delete(self.progress_fill_id)
+
+                        # Draw the new fill rectangle (ensure x2 >= x1)
+                        if x2 > x1:
+                             # Use create_rounded_rect for fill for consistency
+                             self.progress_fill_id = create_rounded_rect(self.progress_canvas, x1, y1, x2, y2,
+                                                                           corner_radius, fill_color, 0, fill_color) # No border for fill, just fill
+                             # Raise the border item so it's drawn on top (assuming border is item ID 1, usually)
+                             # A safer way might be to store border ID, but this often works
+                             self.progress_canvas.tag_raise(1) # Attempt to raise the first item (border)
+                        else:
+                             self.progress_fill_id = None # No fill if width is zero
+
+                        self.root.update_idletasks() # Update UI immediately
+                else:
+                    logger.warning(f"Received unexpected message in queue: {message}")
+
+        except queue.Empty:
+            pass # No messages currently in queue
+
+        # If conversion thread is still referenced (meaning DONE not received yet), schedule next check
+        if self.conversion_thread:
+            self.root.after(100, self.check_progress_queue)
+
+    def start_conversion_event(self, event):
+         """Wrapper for start_conversion to handle event and state."""
+         if self.button_state == tk.NORMAL:
+             self.start_conversion()
+         # Else do nothing if disabled
+
+    def conversion_worker(self):
+        """The actual work done in the conversion thread."""
+        result = None
+        try:
+            logger.info(f"Conversion thread started: {self.input_pdf_path} -> {self.output_pdf_path}")
+            # Pass the queue-based callback method
+            result = convert_pdf_colors(self.input_pdf_path, self.output_pdf_path, self.update_progress)
+            logger.info("Conversion thread finished.")
+        except Exception as e:
+             logger.error(f"Exception in conversion worker thread: {e}", exc_info=True)
+             result = f"Thread Error: {e}" # Ensure result indicates error
+        finally:
+             # Put final result/status into the queue for main thread
+             self.progress_queue.put(("DONE", result))
+
+    def start_conversion(self):
+        """Initiates the PDF conversion process in a background thread."""
+        if not self.input_pdf_path:
+            messagebox.showwarning("No File Selected", "Lütfen önce dönüştürülecek bir PDF dosyası seçin.")
+            return
+
+        logger.debug("Start conversion process initiated.")
+
+        # Generate output path
+        output_dir = os.path.dirname(self.input_pdf_path)
+        base_name = os.path.basename(self.input_pdf_path)
+        output_filename = f"output_{base_name}"
+        self.output_pdf_path = os.path.join(output_dir, output_filename)
+        logger.info(f"Output path set to: {self.output_pdf_path}")
+
+        # --- Update UI for Conversion Start ---
+        logger.debug("Switching button to progress canvas.")
+        self.convert_button_canvas.pack_forget()
+        # Clear previous fill if any
+        if self.progress_fill_id:
+            self.progress_canvas.delete(self.progress_fill_id)
+            self.progress_fill_id = None
+        # Ensure border is drawn (might be overkill but safe)
+        border_width = 6
+        corner_radius = 10
+        create_rounded_rect(self.progress_canvas, border_width/2, border_width/2, self.progress_bar_width - border_width/2, 40 - border_width/2, corner_radius, "white", border_width, "")
+        self.progress_canvas.pack() # Show progress canvas
+        self.set_button_state(tk.DISABLED)
+
+        # Start status animation
+        self.stop_status_animation() # Ensure any previous animation is stopped
+        self.status_label.config(text="Dönüştürülüyor") # Initial text before dots
+        self.status_animation_after_id = self.root.after(500, self.animate_status_dots) # Start animation
+        logger.debug("UI updated for conversion start.")
+
+        self.root.update_idletasks() # Force UI update
+
+        # --- Start Conversion Thread ---
+        logger.info(f"Starting conversion worker thread for: {self.input_pdf_path}")
+        self.conversion_thread = threading.Thread(target=self.conversion_worker, daemon=True)
+        self.conversion_thread.start()
+
+        # --- Start checking the progress queue --- 
+        self.root.after(100, self.check_progress_queue)
+
+    def handle_conversion_complete(self, result):
+        """Handles UI updates after conversion thread finishes."""
+        logger.info(f"Handling conversion completion. Result: {result}")
+        # --- Final UI Updates ---
+        self.stop_status_animation()
+
+        # Hide progress canvas, show button again
+        logger.debug("Switching progress canvas back to button.")
+        self.progress_canvas.pack_forget()
+        self.convert_button_canvas.pack()
+        self.set_button_state(tk.NORMAL) # Re-enable button
+
+        if result is None:
+            # Success
+            # Truncate the output path for display
+            try:
+                drive, path_part = os.path.splitdrive(self.output_pdf_path)
+                filename = os.path.basename(self.output_pdf_path)
+                # Handle case where path might be just a filename in CWD
+                if drive and path_part != filename:
+                    truncated_path = f"{drive}{os.sep}...{os.sep}{filename}"
+                else: # If no drive or path is just filename
+                    truncated_path = filename
+            except Exception:
+                 # Fallback in case path manipulation fails
+                 truncated_path = os.path.basename(self.output_pdf_path)
+
+            success_msg = f"Dönüştürme başarılı! | {truncated_path}" # Use truncated path
+            self.status_label.config(text=success_msg)
+            logger.info(f"Conversion successful: {self.output_pdf_path}") # Log full path
+            # Show output preview in right box
+            self.show_output_preview()
+        else:
+            # Failure
+            error_msg = f"Hata oluştu: {result}"
+            self.status_label.config(text=error_msg)
+            messagebox.showerror("Conversion Error", f"PDF dönüştürme sırasında bir hata oluştu:\n\n{result}")
+            logger.error(f"Conversion failed: {result}")
+            # Reset input state? Optional
+            # self.input_pdf_path = None
+            # self.recreate_left_box_initial_content()
+
+    def show_output_preview(self):
+        """Renders and displays the first page of the OUTPUT PDF in the right box."""
+        logger.debug(f"Attempting to show preview of output file: {self.output_pdf_path}")
+        if not self.output_pdf_path or not os.path.exists(self.output_pdf_path):
+             logger.error(f"Output file path not valid or file doesn't exist: {self.output_pdf_path}")
+             self.right_box.delete("all")
+             create_rounded_rect(self.right_box, 6/2, 6/2, 371 - 6/2, 466 - 6/2, 10, "white", 6, "") # Redraw border
+             self.right_box.create_text(371/2, 466/2, text="Önizleme Yok", fill="#555555", font=("Inter", 18, "bold"))
+             return
+
+        doc = None
+        try:
+            box_width = 371
+            box_height = 466
+            border_width = 6
+            corner_radius = 10
+            logger.debug("Opening OUTPUT PDF document for preview.")
+            doc = fitz.open(self.output_pdf_path)
+            if len(doc) == 0: raise ValueError("Output PDF document has no pages.")
+            page = doc[0]
+
+            target_width_available = box_width - (2 * border_width)
+            target_height_available = box_height - (2 * border_width)
+            page_rect = page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            if page_width <= 0 or page_height <= 0:
+                 raise ValueError(f"Invalid page dimensions in output PDF: {page_width}x{page_height}")
+
+            zoom_w = target_width_available / page_width
+            zoom_h = target_height_available / page_height
+            zoom = min(zoom_w, zoom_h)
+            final_width = int(page_width * zoom)
+            final_height = int(page_height * zoom)
+            mat = fitz.Matrix(1, 1)
+            pix = page.get_pixmap(matrix=mat, dpi=150)
+            if doc: doc.close(); doc = None
+
+            if pix.alpha:
+                pil_image = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+            else:
+                pil_image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            resized_pil_image = pil_image.resize((final_width, final_height), Image.Resampling.LANCZOS)
+            self.output_preview_image_tk = ImageTk.PhotoImage(resized_pil_image) # Use separate attribute
+            logger.debug(f"Output preview PhotoImage created: {self.output_preview_image_tk}")
+
+            # Display in Right Box
+            self.right_box.delete("all")
+            create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+            self.right_box.create_image(box_width / 2, box_height / 2, anchor=tk.CENTER, image=self.output_preview_image_tk)
+            logger.debug("Output preview displayed in right box.")
+
+        except Exception as e:
+             if doc: doc.close()
+             error_msg = f"Error generating output preview: {e}"
+             logger.error(error_msg, exc_info=True)
+             self.right_box.delete("all")
+             create_rounded_rect(self.right_box, 6/2, 6/2, 371 - 6/2, 466 - 6/2, 10, "white", 6, "") # Redraw border
+             self.right_box.create_text(371/2, 466/2, text="Önizleme Hatası", fill="#FF0000", font=("Inter", 18, "bold"))
+
+# --- Main execution block ---
+if __name__ == "__main__":
+    # --- Fallback Font Configuration ---
+    # Use global fallback_paths defined at the top
+    fallback_paths.update({
+        'regular': 'C:/Windows/Fonts/arial.ttf',
+        'bold': 'C:/Windows/Fonts/arialbd.ttf',
+        'italic': 'C:/Windows/Fonts/ariali.ttf',
+        'bold_italic': 'C:/Windows/Fonts/arialbi.ttf'
+    })
+
+    # --- Logging Configuration ---
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Set root logger level potentially lower if needed, but set specific logger to DEBUG
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    logging.getLogger(__name__).setLevel(logging.DEBUG) # Ensure our logger is set to DEBUG
+    # Also set pdf_processor logger if it's used elsewhere and needs debug logs
+    logging.getLogger('pdf_processor').setLevel(logging.DEBUG)
+
+    # --- GUI Setup ---
+    # Use TkinterDnD.Tk for the root window
+    logger.debug("Initializing TkinterDnD root window.")
+    main_root = TkinterDnD.Tk() # Use TkinterDnD
+    logger.debug("Creating PDFDarkModeApp instance.")
+    app = PDFDarkModeApp(main_root)
+    logger.debug("Starting mainloop.")
+    main_root.mainloop() 
