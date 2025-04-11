@@ -66,5 +66,5 @@ dmypy.json
 # pytype static checker
 .pytype/
 
-# Output files from this project
-output_*.pdf 
+# PDF files from this project
+*.pdf 
