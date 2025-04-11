@@ -1,7 +1,9 @@
 import fitz  # PyMuPDF
 import logging
 import os
-import sys
+import platform # <-- Add platform import
+import subprocess # <-- Add subprocess import
+import sys # <-- Add sys import
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk # Import Pillow for image resizing
@@ -9,6 +11,7 @@ from typing import Optional, Dict, Callable
 from tkinterdnd2 import DND_FILES, TkinterDnD # Import TkinterDnD
 import threading # Added for running conversion in background
 import queue # Added for thread communication
+from pathlib import Path # <-- Add pathlib import
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +22,16 @@ fallback_fonts: Dict[str, Optional[fitz.Font]] = {}
 
 # Dictionary to hold paths to fallback fonts
 fallback_paths = {}
+
+# --- Helper function for PyInstaller assets ---
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # Helper function to draw rounded rectangles on a canvas
 def create_rounded_rect(canvas, x1, y1, x2, y2, radius, outline_color, outline_width, fill_color):
@@ -258,6 +271,9 @@ class PDFDarkModeApp:
         self.root.title("PDF Dark Mode Converter")
         self.root.configure(bg="black", padx=50, pady=50)
 
+        # Center the window shortly after it's drawn
+        self.root.after(10, self.center_window)
+
         self.input_pdf_path = None
         self.output_pdf_path = None
         self.button_state = tk.NORMAL
@@ -265,6 +281,7 @@ class PDFDarkModeApp:
         self.upload_icon_image = None
         self.output_preview_image_tk = None
         self.progress_fill_id = None # ID for the progress bar fill rectangle
+        self.app_state = "initial" # Add state variable: initial, ready, converting, finished
 
         # --- Threading & Queue --- 
         self.conversion_thread = None
@@ -275,9 +292,11 @@ class PDFDarkModeApp:
         self.style = ttk.Style()
         self.style.configure("TLabel", background="black", foreground="white", font=("Inter", 22, "bold"))
         self.style.configure("TFrame", background="black")
+        self.style.configure("Clickable.TLabel", background="black", foreground="white", font=("Inter", 22, "bold", "italic"))
+        self.style.configure("Status.TLabel", background="black", foreground="white", font=("Inter", 22, "bold")) # Default style
 
         # --- Component 1: Status Label ---
-        self.status_label = ttk.Label(root, text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle", font=("Inter", 22, "bold"), wraplength=root.winfo_screenwidth() - 100)
+        self.status_label = ttk.Label(root, text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle", style="Status.TLabel", wraplength=root.winfo_screenwidth() - 100)
         self.status_label.pack(pady=(0, 40))
 
         # --- Component 2: Boxes and Arrow ---
@@ -296,10 +315,11 @@ class PDFDarkModeApp:
         arrow_width = 0
         try:
             # Use Pillow to reliably get size without creating Tk object yet
-            arrow_img_pil = Image.open("arrow.png")
+            arrow_img_path = resource_path("arrow.png") # <-- Use resource_path
+            arrow_img_pil = Image.open(arrow_img_path)
             arrow_width = arrow_img_pil.width
             self.arrow_image = ImageTk.PhotoImage(arrow_img_pil) # Store Tk image for later use
-            logger.debug(f"Arrow image loaded, width: {arrow_width}")
+            logger.debug(f"Arrow image loaded from {arrow_img_path}, width: {arrow_width}")
         except Exception as e:
              logger.warning(f"Could not load arrow.png to determine width: {e}")
              # Estimate or use a default if needed, or make progress bar width fixed
@@ -355,6 +375,15 @@ class PDFDarkModeApp:
         # Initial setup of icon/text in left box
         self.recreate_left_box_initial_content() # This now also draws initial border
 
+    def center_window(self):
+        """Centers the window on the screen."""
+        self.root.update_idletasks() # Ensure window dimensions are up-to-date
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+
     def handle_drop(self, event):
         """Handles file drop events on the left box."""
         filepath_string = event.data
@@ -409,13 +438,19 @@ class PDFDarkModeApp:
             # --- Update state --- 
             self.input_pdf_path = filepath
             base_name = os.path.basename(filepath)
-            self.status_label.config(text="DÖNÜŞTÜR butonuna bas")
-            logger.info(f"Input PDF set: {self.input_pdf_path}")
+            # Reset status label to non-clickable state before showing standard message
+            self.status_label.config(text="DÖNÜŞTÜR butonuna bas", style="Status.TLabel", cursor="")
+            self.status_label.unbind("<Button-1>")
+            self.app_state = "ready" # Set state to ready for conversion
+            logger.info(f"Input PDF set: {self.input_pdf_path}, App state: {self.app_state}")
 
             # --- Clear existing content --- 
             logger.debug("Clearing left and right boxes for preview.")
             self.left_box.delete("all") 
+            self.right_box.configure(bg="black") # Ensure right box is black before clearing
             self.right_box.delete("all") 
+            self.right_box.config(cursor="") # Reset cursor
+            self.right_box.unbind("<Button-1>") # Unbind click
 
             # --- Render and Resize PDF Preview using Pillow --- 
             logger.debug("Opening PDF document for preview.")
@@ -478,17 +513,22 @@ class PDFDarkModeApp:
 
             # --- Display Preview --- 
             logger.debug("Displaying preview image.")
-            # Redraw border first
             create_rounded_rect(self.left_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
             img_x_pos = box_width / 2
             img_y_pos = box_height / 2
             logger.debug(f"Placing PhotoImage on canvas at ({img_x_pos}, {img_y_pos}) with anchor=CENTER.")
             self.left_box.create_image(img_x_pos, img_y_pos, anchor=tk.CENTER, image=self.preview_image_tk)
-            # No need for extra image_ref here, self.preview_image_tk is sufficient
             logger.debug("create_image called.")
+            # Reset cursor for left box now that preview is shown
+            self.left_box.config(cursor="")
+            self.left_box.unbind("<Enter>") # Unbind hover effects
+            self.left_box.unbind("<Leave>")
 
             # --- Redraw Right Box & Enable Button --- 
-            logger.debug("Redrawing right box border and enabling button after preview.")
+            logger.debug("Redrawing right box border (black background) and enabling button after preview.")
+            # Ensure right box is not clickable yet
+            self.right_box.config(cursor="")
+            self.right_box.unbind("<Button-1>")
             create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
             self.set_button_state(tk.NORMAL)
             logger.debug(f"Processing finished for file: {filepath}")
@@ -501,9 +541,11 @@ class PDFDarkModeApp:
              # Reset state
              logger.debug("Resetting state after error during file processing.")
              self.input_pdf_path = None
-             self.status_label.config(text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle")
+             self.status_label.config(text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle", style="Status.TLabel", cursor="")
+             self.status_label.unbind("<Button-1>")
              # Reset boxes to initial state
              self.recreate_left_box_initial_content() # Handles left box clearing/redrawing
+             self.right_box.configure(bg="black") # Ensure right box is black on error reset
              self.right_box.delete("all") # Clear right box
              # Redraw right border
              box_width = 371
@@ -512,6 +554,9 @@ class PDFDarkModeApp:
              corner_radius = 10
              create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
              self.set_button_state(tk.NORMAL)
+             self.app_state = "initial" # Reset state on error
+             # Ensure cursor is reset on error too if recreate doesn't handle it
+             self.left_box.config(cursor="")
 
     def recreate_left_box_initial_content(self):
         """Helper to redraw the initial icon and text in the left box."""
@@ -535,7 +580,8 @@ class PDFDarkModeApp:
             # Reload image if necessary or use cached
             if not self.upload_icon_image:
                  logger.debug("Reloading upload icon image.")
-                 self.upload_icon_image = tk.PhotoImage(file="add_file.png")
+                 icon_path = resource_path("add_file.png") # <-- Use resource_path
+                 self.upload_icon_image = tk.PhotoImage(file=icon_path)
 
             self.upload_icon_widget = tk.Label(self.left_box, image=self.upload_icon_image, background=fill_color)
             self.upload_icon_widget.image = self.upload_icon_image
@@ -552,10 +598,28 @@ class PDFDarkModeApp:
         self.left_box.create_window(box_width / 2, icon_y_pos, window=self.upload_icon_widget)
         self.left_box.create_window(box_width / 2, text_y_pos, window=self.upload_text_widget)
 
-        # Re-bind clicks to the newly created widgets
+        # Bind clicks to widgets for file selection
         logger.debug("Re-binding click events for initial left box content.")
         self.upload_icon_widget.bind("<Button-1>", self.select_file_event)
         self.upload_text_widget.bind("<Button-1>", self.select_file_event)
+
+        # Bind hover events to the CANVAS for cursor change
+        logger.debug("Binding <Enter>/<Leave> to left_box canvas for cursor.")
+        self.left_box.bind("<Enter>", self.on_left_box_enter)
+        self.left_box.bind("<Leave>", self.on_left_box_leave)
+        # Set initial cursor (optional, good practice)
+        self.left_box.config(cursor="")
+
+    def on_left_box_enter(self, event):
+        """Change cursor to hand when mouse enters the left box (initial state)."""
+        # Only change cursor if the app is in the initial state (or ready before conversion)
+        # Or simply check if the specific widgets exist? Less state dependent.
+        if hasattr(self, 'upload_icon_widget') and self.upload_icon_widget.winfo_exists():
+             self.left_box.config(cursor="hand2")
+
+    def on_left_box_leave(self, event):
+        """Change cursor back to default when mouse leaves the left box."""
+        self.left_box.config(cursor="")
 
     def set_button_state(self, state):
         """Visually enable/disable the canvas button."""
@@ -656,15 +720,22 @@ class PDFDarkModeApp:
             self.root.after(100, self.check_progress_queue)
 
     def start_conversion_event(self, event):
-         """Wrapper for start_conversion to handle event and state."""
-         if self.button_state == tk.NORMAL:
+         """Wrapper for start_conversion or reset based on state."""
+         logger.debug(f"Button clicked. Current state: {self.app_state}")
+         if self.app_state == "finished":
+             logger.info("Resetting application state.")
+             self.reset_application()
+         elif self.app_state == "ready" and self.button_state == tk.NORMAL:
+             logger.info("Starting conversion.")
              self.start_conversion()
-         # Else do nothing if disabled
+         else:
+             logger.warning(f"Button click ignored. State: {self.app_state}, Button State: {self.button_state}")
 
     def conversion_worker(self):
         """The actual work done in the conversion thread."""
         result = None
         try:
+            self.app_state = "converting" # Set state during conversion
             logger.info(f"Conversion thread started: {self.input_pdf_path} -> {self.output_pdf_path}")
             # Pass the queue-based callback method
             result = convert_pdf_colors(self.input_pdf_path, self.output_pdf_path, self.update_progress)
@@ -735,30 +806,50 @@ class PDFDarkModeApp:
 
         if result is None:
             # Success
-            # Truncate the output path for display
             try:
-                drive, path_part = os.path.splitdrive(self.output_pdf_path)
-                filename = os.path.basename(self.output_pdf_path)
-                # Handle case where path might be just a filename in CWD
-                if drive and path_part != filename:
-                    truncated_path = f"{drive}{os.sep}...{os.sep}{filename}"
-                else: # If no drive or path is just filename
-                    truncated_path = filename
-            except Exception:
-                 # Fallback in case path manipulation fails
-                 truncated_path = os.path.basename(self.output_pdf_path)
+                # Create a shorter path for display
+                full_path = Path(self.output_pdf_path)
+                parts = full_path.parts
+                if len(parts) > 3:
+                    # Show ellipsis, last two folders, and filename
+                    short_path_display = os.path.join("...", parts[-3], parts[-2], parts[-1])
+                else:
+                    # Show full path if it's already short
+                    short_path_display = str(full_path)
+                success_msg = f"Dönüştürme başarılı! | {short_path_display}"
+                logger.info(f"Displaying short path: {short_path_display} (Full: {self.output_pdf_path})")
+            except Exception as path_err:
+                # Fallback to full path if shortening fails
+                logger.error(f"Error shortening path: {path_err}", exc_info=True)
+                success_msg = f"Dönüştürme başarılı! | {self.output_pdf_path}"
 
-            success_msg = f"Dönüştürme başarılı! | {truncated_path}" # Use truncated path
-            self.status_label.config(text=success_msg)
-            logger.info(f"Conversion successful: {self.output_pdf_path}") # Log full path
+            # Configure label for clickable appearance and bind event (to open folder)
+            self.status_label.config(text=success_msg, style="Clickable.TLabel", cursor="hand2")
+            self.status_label.bind("<Button-1>", self.open_output_location)
+            self.app_state = "finished"
+            self.set_button_state(tk.NORMAL) # Ensure button is visually enabled
+            logger.info(f"Conversion successful: {self.output_pdf_path}, App state: {self.app_state}")
+            
             # Show output preview in right box
             self.show_output_preview()
+
+            # Make right box clickable to open the PDF
+            logger.debug("Binding click event to right_box to open output PDF.")
+            self.right_box.config(cursor="hand2")
+            self.right_box.bind("<Button-1>", self.open_output_pdf)
         else:
             # Failure
             error_msg = f"Hata oluştu: {result}"
-            self.status_label.config(text=error_msg)
-            messagebox.showerror("Conversion Error", f"PDF dönüştürme sırasında bir hata oluştu:\n\n{result}")
-            logger.error(f"Conversion failed: {result}")
+            # Ensure label is reset to non-clickable on failure
+            self.status_label.config(text=error_msg, style="Status.TLabel", cursor="")
+            self.status_label.unbind("<Button-1>")
+            messagebox.showerror("Conversion Error", f"PDF dönüştürme sırasında bir hata oluştu:\\n\\n{result}")
+            # Reset state to allow trying again or selecting new file
+            self.app_state = "ready" if self.input_pdf_path else "initial"
+            self.set_button_state(tk.NORMAL) # Re-enable button
+            # Set button text back to default on error
+            self.convert_button_canvas.itemconfig(self.button_text_id, text="DÖNÜŞTÜR")
+            logger.error(f"Conversion failed: {result}, App state reset to: {self.app_state}")
             # Reset input state? Optional
             # self.input_pdf_path = None
             # self.recreate_left_box_initial_content()
@@ -809,19 +900,143 @@ class PDFDarkModeApp:
             self.output_preview_image_tk = ImageTk.PhotoImage(resized_pil_image) # Use separate attribute
             logger.debug(f"Output preview PhotoImage created: {self.output_preview_image_tk}")
 
-            # Display in Right Box
+            # Display in Right Box (with WHITE background)
+            logger.debug("Setting right box background to white for output preview.")
+            self.right_box.configure(bg="white") # <--- Set background to white HERE
             self.right_box.delete("all")
-            create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+            create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "") # Border is still white
             self.right_box.create_image(box_width / 2, box_height / 2, anchor=tk.CENTER, image=self.output_preview_image_tk)
             logger.debug("Output preview displayed in right box.")
+
+            # Ensure cursor is set correctly based on app state after preview shows
+            if self.app_state == "finished":
+                self.right_box.config(cursor="hand2")
+            else:
+                 self.right_box.config(cursor="")
 
         except Exception as e:
              if doc: doc.close()
              error_msg = f"Error generating output preview: {e}"
              logger.error(error_msg, exc_info=True)
+             logger.debug("Setting right box background back to black after preview error.")
+             self.right_box.configure(bg="black") # Set back to black on error
              self.right_box.delete("all")
              create_rounded_rect(self.right_box, 6/2, 6/2, 371 - 6/2, 466 - 6/2, 10, "white", 6, "") # Redraw border
              self.right_box.create_text(371/2, 466/2, text="Önizleme Hatası", fill="#FF0000", font=("Inter", 18, "bold"))
+
+    def open_output_pdf(self, event=None):
+        """Opens the generated PDF file in the default system viewer."""
+        logger.info(f"Attempting to open output PDF: {self.output_pdf_path}")
+        if not self.output_pdf_path or not os.path.exists(self.output_pdf_path):
+            logger.warning(f"Output path is not set or file does not exist: {self.output_pdf_path}")
+            messagebox.showwarning("File Not Found", "Oluşturulan PDF dosyası bulunamadı.")
+            return
+
+        filepath = os.path.normpath(self.output_pdf_path) # Normalize path
+        system = platform.system()
+
+        try:
+            if system == "Windows":
+                logger.debug(f"Running command: os.startfile(\"{filepath}\")")
+                os.startfile(filepath)
+            elif system == "Darwin": # macOS
+                logger.debug(f"Running command: open \"{filepath}\"")
+                subprocess.run(['open', filepath], check=True)
+            else: # Linux and other Unix-like systems
+                logger.debug(f"Running command: xdg-open \"{filepath}\"")
+                subprocess.run(['xdg-open', filepath], check=True)
+            logger.info(f"Successfully initiated opening of {filepath}")
+        except FileNotFoundError:
+            logger.error(f"Command not found for opening PDF on {system}.")
+            messagebox.showerror("Error", f"Varsayılan PDF görüntüleyici açılamadı ({system}).")
+        except Exception as e:
+            logger.error(f"Failed to open PDF file '{filepath}' on {system}: {e}", exc_info=True)
+            messagebox.showerror("Error", f"PDF dosyası açılamadı: {e}")
+
+    def open_output_location(self, event=None):
+        """Opens the file explorer to the location of the output PDF."""
+        logger.info(f"Attempting to open file location for: {self.output_pdf_path}")
+        if not self.output_pdf_path or not os.path.exists(self.output_pdf_path):
+            logger.warning(f"Output path is not set or file does not exist: {self.output_pdf_path}")
+            messagebox.showwarning("File Not Found", "Oluşturulan PDF dosyası bulunamadı.")
+            return
+
+        filepath_raw = self.output_pdf_path
+        system = platform.system()
+        return_code = None # Variable to store return code
+
+        try:
+            if system == "Windows":
+                filepath_norm = os.path.normpath(filepath_raw)
+                command = ['explorer', '/select,', filepath_norm]
+                logger.debug(f"Running command: {' '.join(command)}")
+                # Run without check=True, but capture the result
+                result = subprocess.run(command)
+                return_code = result.returncode
+                logger.info(f"'explorer /select' command finished with return code: {return_code}")
+                # Don't raise error for common non-zero codes if explorer still worked
+                if return_code != 0:
+                     logger.warning(f"'explorer /select' returned non-zero exit status {return_code}. This might be okay if the folder opened.")
+
+            elif system == "Darwin": # macOS
+                filepath_norm = os.path.normpath(filepath_raw)
+                command = ['open', '-R', filepath_norm]
+                logger.debug(f"Running command: {' '.join(command)}")
+                result = subprocess.run(command, check=True) # Keep check=True for macOS
+                return_code = result.returncode
+                logger.info(f"'open -R' command finished with return code: {return_code}")
+
+            else: # Linux and other Unix-like systems
+                directory = os.path.dirname(os.path.normpath(filepath_raw))
+                command = ['xdg-open', directory]
+                logger.debug(f"Running command: {' '.join(command)}")
+                result = subprocess.run(command, check=True) # Keep check=True for Linux
+                return_code = result.returncode
+                logger.info(f"'xdg-open' command finished with return code: {return_code}")
+
+        except FileNotFoundError:
+             logger.error(f"Command not found for opening file explorer on {system}.")
+             messagebox.showerror("Error", f"Dosya gezgini açılamadı ({system}). Komut bulunamadı.")
+        except subprocess.CalledProcessError as e: # Catch errors only for non-Windows check=True cases
+             logger.error(f"Command failed for {system}: {e}", exc_info=True)
+             messagebox.showerror("Error", f"Dosya konumu açılamadı ({system}): {e}")
+        except Exception as e:
+             # Catch other potential errors like permission issues
+             logger.error(f"Failed to open file location '{filepath_raw}' on {system}: {e}", exc_info=True)
+             messagebox.showerror("Error", f"Dosya konumu açılırken genel bir hata oluştu: {e}")
+
+    def reset_application(self):
+        """Resets the application to its initial state."""
+        logger.info("Resetting application UI and state.")
+        self.input_pdf_path = None
+        self.output_pdf_path = None
+        self.app_state = "initial"
+
+        # Reset status label to default non-clickable state
+        self.status_label.config(text="Okunabilir hale getirmek istediğin dosyayı seç veya alana sürükle", style="Status.TLabel", cursor="")
+        self.status_label.unbind("<Button-1>")
+
+        # Reset left box
+        self.recreate_left_box_initial_content()
+
+        # Reset right box (clear preview, set background to black, remove click)
+        logger.debug("Resetting right box: setting background to black, clearing content, removing click.")
+        self.right_box.configure(bg="black") 
+        self.right_box.delete("all")
+        self.right_box.config(cursor="") # Reset cursor
+        self.right_box.unbind("<Button-1>") # Unbind click
+        # Define dimensions needed for border redraw
+        box_width = 371
+        box_height = 466
+        border_width = 6
+        corner_radius = 10
+        create_rounded_rect(self.right_box, border_width/2, border_width/2, box_width - border_width/2, box_height - border_width/2, corner_radius, "white", border_width, "")
+
+        # Reset button text and state
+        self.convert_button_canvas.itemconfig(self.button_text_id, text="DÖNÜŞTÜR")
+        self.set_button_state(tk.NORMAL) # Ensure it's visually enabled
+
+        logger.info("Application reset complete.")
 
 # --- Main execution block ---
 if __name__ == "__main__":
