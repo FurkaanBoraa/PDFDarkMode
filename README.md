@@ -31,28 +31,31 @@ cd PDFDarkMode
 pip install -r requirements.txt
 ```
 
+## Download Executable
+
+For a standalone Windows executable (.exe) that doesn't require Python installation, please check the **[Releases](https://github.com/FurkaanBoraa/PDFDarkMode/releases)** page on GitHub.
+
+Download the `PDFDarkConverter.exe` file from the latest release assets.
+
 ## Usage
 
+If running from source code:
 1. Place your PDF file in the project directory
 2. Run the script:
 ```bash
-python test_processor.py
+python pdf_processor.py # Updated to use the GUI script
 ```
 
-The script will create an output file with the prefix "output_" followed by the original filename.
+If using the downloaded executable (`PDFDarkConverter.exe`), simply double-click it to run.
+
+Use the application window to select or drag-and-drop your PDF file.
+The converted dark mode PDF will be saved in the same directory as the input file (or the executable, if run standalone) with the prefix `output_`.
 
 ## Configuration
 
-The script uses fallback fonts from the Windows Fonts directory by default. You can modify the font paths in `test_processor.py`:
+When running from source, the script uses fallback fonts from the Windows Fonts directory by default. You can modify the font paths in `pdf_processor.py`.
 
-```python
-fallback_paths = {
-    'regular': 'C:/Windows/Fonts/arial.ttf',
-    'bold': 'C:/Windows/Fonts/arialbd.ttf',
-    'italic': 'C:/Windows/Fonts/ariali.ttf',
-    'bold_italic': 'C:/Windows/Fonts/arialbi.ttf'
-}
-```
+The standalone executable relies on standard Windows fonts (like Arial) being available on the system where it's run.
 
 ## Contributing
 
