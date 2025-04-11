@@ -12,11 +12,14 @@ A Python tool for converting PDFs to dark mode by inverting colors and handling 
 
 ## Requirements
 
+For running from source code:
 - Python 3.6+
-- PyMuPDF (fitz)
-- logging
-- os
-- sys
+- PyMuPDF (`fitz`)
+- Pillow (`PIL`)
+- TkinterDnD2
+- *(Standard libraries like `os`, `sys`, `logging`, `tkinter` are also used)*
+
+See `requirements.txt` for specific versions used for installation.
 
 ## Installation
 
